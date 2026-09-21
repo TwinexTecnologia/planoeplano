@@ -1,0 +1,24 @@
+# Render Blueprint — Deploy automático do backend NestJS
+# Link no portal Render: New → Blueprint → Cole este arquivo
+# Plano Free Web Service (750h mês grátis, dorme após 15min inativo)
+services:
+  - type: web
+    name: costbase-backend
+    env: docker
+    dockerfilePath: ./apps/backend/Dockerfile
+    region: sao_paulo
+    plan: free
+    numInstances: 1
+    healthCheckPath: /api/health
+    # Vars obrigatórias - defina estas na UI do Render depois do 1º deploy
+    envVars:
+      - key: DATABASE_URL
+        sync: false            # Cole manualmente a URI Supabase Transaction Mode
+      - key: BACKEND_PORT
+        value: "10000"         # Padrão do Render
+      - key: BACKEND_CORS_ORIGIN
+        value: "https://SEU-PROJETO.vercel.app,http://localhost:3000"
+      - key: JWT_ACCESS_SECRET
+        generateValue: true    # Render gera um aleatório forte automaticamente
+      - key: JWT_REFRESH_SECRET
+        generateValue: true

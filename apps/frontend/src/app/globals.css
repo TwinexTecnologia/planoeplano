@@ -1,0 +1,100 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 60% 99%;
+    --foreground: 240 15% 15%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 240 15% 15%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 15% 15%;
+
+    --primary: 239 90% 65%;        /* brand-500 = #5557F6 */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 240 10% 96%;
+    --secondary-foreground: 240 15% 20%;
+
+    --muted: 240 10% 96%;
+    --muted-foreground: 240 10% 45%;
+
+    --accent: 239 84% 96%;
+    --accent-foreground: 239 90% 45%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 240 12% 92%;
+    --input: 240 12% 92%;
+    --ring: 239 90% 65%;
+
+    /* Sidebar escura (brand-950) */
+    --sidebar: 240 50% 13%;
+    --sidebar-foreground: 240 20% 85%;
+    --sidebar-accent: 239 70% 35%;
+    --sidebar-accent-foreground: 0 0% 100%;
+    --sidebar-border: 240 40% 20%;
+
+    --radius: 0.6rem;
+  }
+
+  .dark {
+    --background: 240 30% 8%;
+    --foreground: 240 20% 90%;
+    --card: 240 30% 10%;
+    --card-foreground: 240 20% 90%;
+    --border: 240 20% 20%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}
+
+/* ---------- Utilitários do CostBase ---------- */
+
+@layer utilities {
+  .cb-card {
+    @apply bg-card text-card-foreground border border-border rounded-xl shadow-sm;
+  }
+
+  .cb-kpi-label {
+    @apply text-xs font-medium text-muted-foreground uppercase tracking-wide;
+  }
+
+  .cb-kpi-value {
+    @apply text-2xl font-semibold tracking-tight;
+  }
+
+  .cb-variacao-pos {
+    @apply text-status-up;
+  }
+  .cb-variacao-neg {
+    @apply text-status-down;
+  }
+
+  .cb-var-badge-pos {
+    @apply bg-status-up/10 text-status-up;
+  }
+  .cb-var-badge-neg {
+    @apply bg-status-down/10 text-status-down;
+  }
+
+  .cb-scrollbar-thin {
+    scrollbar-width: thin;
+  }
+  .cb-scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+  .cb-scrollbar-thin::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.25);
+    border-radius: 9999px;
+  }
+}

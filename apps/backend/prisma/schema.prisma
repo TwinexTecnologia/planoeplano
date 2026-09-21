@@ -1,0 +1,595 @@
+// ============================================================
+// COSTBASE — Schema Prisma (Sprint 0)
+//
+// ARQUITETURA DE 3 CAMADAS:
+//   1. RAW / BRONZE   — dado original exatamente como recebido
+//   2. CANONICAL      — item canônico, identidade permanente, histórico
+//   3. CALCULATED     — pesos, cesta, ICPP-SP, comparação de índices
+//
+// REGRAS RÍGIDAS (NÃO ALTERAR SEM VALIDAÇÃO):
+//   - TODAS tabelas de negócio têm company_id → SaaS multiempresa
+//   - Toda UNIQUE key é composta com company_id (evita colisão entre tenancies)
+//   - Tabela audit_logs registra qualquer alteração sensível
+//   - NÃO existem fórmulas hardcoded de ICPP aqui — regras ficam em
+//     icpp_methodologies.regras_* (JSONB) e são implementadas no motor de cálculo
+//   - raw_row_json preserva CADA CÉLULA original do Excel (Bronze Long)
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// 0. TENANCY & AUTENTICAÇÃO
+// ============================================================
+
+enum PlanoEmpresa {
+  TRIAL
+  BASICO
+  PRO
+  ENTERPRISE
+}
+
+enum RoleUsuario {
+  OWNER
+  ADMIN
+  ANALISTA
+  REVISOR
+  VISUALIZADOR
+}
+
+model companies {
+  id                  String    @id @default(uuid())
+  nome                String
+  cnpj                String?   @db.VarChar(18)
+  plano               PlanoEmpresa @default(TRIAL)
+  dados_empresa_json  Json?
+  ativo               Boolean   @default(true)
+  created_at          DateTime  @default(now())
+  updated_at          DateTime  @updatedAt
+
+  users                    users[]
+  categories               categories[]
+  families                 families[]
+  canonical_items          canonical_items[]
+  item_aliases             item_aliases[]
+  periods                  periods[]
+  imports                  imports[]
+  external_indexes         external_indexes[]
+  icpp_methodologies       icpp_methodologies[]
+  audit_logs               audit_logs[]
+
+  @@index([cnpj])
+  @@map("companies")
+}
+
+model users {
+  id           String       @id @default(uuid())
+  company_id   String
+  email        String
+  nome         String
+  senha_hash   String
+  role         RoleUsuario  @default(VISUALIZADOR)
+  ativo        Boolean      @default(true)
+  ultimo_login DateTime?
+  created_at   DateTime     @default(now())
+  updated_at   DateTime     @updatedAt
+
+  company      companies    @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  audit_logs   audit_logs[]
+
+  @@unique([company_id, email])
+  @@index([company_id])
+  @@map("users")
+}
+
+// ============================================================
+// 1. CAMADA RAW / BRONZE — dado original, NUNCA ALTERADO
+// ============================================================
+
+enum StatusImport {
+  UPLOADED
+  PARSING
+  PARSED
+  MATCHING
+  MATCHED
+  REVIEW_REQUIRED
+  COMPLETED
+  FAILED
+}
+
+model imports {
+  id               String       @id @default(uuid())
+  company_id       String
+  period_id        String?      // competência de destino (pode ser definida depois)
+  nome_arquivo     String       // ex: "Cesta_Basica_SET_26.xlsx"
+  nome_original    String       // nome do arquivo no upload do usuário
+  hash_arquivo     String       @db.VarChar(64) // SHA-256 p/ auditoria
+  tamanho_bytes    BigInt?
+  tipo_arquivo     String       @db.VarChar(16) // "xlsx" | "csv"
+  mapeamento_colunas Json       // {coluna_excel: "codigo" | "descricao" | "categoria" | ...}
+  status           StatusImport @default(UPLOADED)
+  total_linhas     Int          @default(0)
+  linhas_processadas Int        @default(0)
+  created_by       String?      // user_id
+  created_at       DateTime     @default(now())
+  updated_at       DateTime     @updatedAt
+
+  company      companies     @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  period       periods?      @relation(fields: [period_id], references: [id], onDelete: SetNull)
+  import_rows  import_rows[]
+
+  @@unique([company_id, hash_arquivo]) // um mesmo arquivo não importa 2x
+  @@index([company_id, created_at])
+  @@map("imports")
+}
+
+model import_rows {
+  id                         String   @id @default(uuid())
+  company_id                 String
+  import_id                  String
+  linha_excel_origem         Int      // número da linha no XLSX original
+
+  // ---------- BRONZE LONG — célula-a-célula, PRESERVADO ----------
+  raw_row_json               Json     // TODO O conteúdo original da linha (todas as colunas)
+
+  // ---------- Campos parseados (mappings do usuário, podem ser NULL) ----------
+  parsed_codigo              String?
+  parsed_descricao           String?
+  parsed_categoria           String?
+  parsed_unidade             String?
+  parsed_quantidade          Decimal? @db.Decimal(20, 6)
+  parsed_preco_unitario      Decimal? @db.Decimal(20, 6)
+  parsed_preco_total         Decimal? @db.Decimal(20, 6)
+  parsed_data_referencia     DateTime?
+  parsed_eap_nivel           String?
+  parsed_eap_codigo          String?
+  parsed_peso_orcamento      Decimal? @db.Decimal(10, 8)
+  parsed_coluna_extra_json   Json?    // campos customizados que sobraram
+
+  // ---------- Matching (estágios 1,2,3) ----------
+  alias_hash                 String?  // hash da descrição normalizada p/ match rápido
+  match_status               String?  @db.VarChar(32) // "auto_matched"|"review_needed"|"new"|"ignored"
+  canonical_item_id_sugerido String?
+  match_confidence           Decimal? @db.Decimal(5, 4) // 0.0000 a 1.0000
+  match_estagio              Int?     // 1=hash, 2=tfidf, 3=embedding
+  match_caracteristicas_json Json?    // {tipo, material, largura, altura, folhas, ...} da IA
+
+  // ---------- Decisão final (pós-revisão) ----------
+  canonical_item_id_final    String?
+  decidido_por               String?    // user_id
+  decidido_em                DateTime?
+
+  import_ref                 imports    @relation(fields: [import_id], references: [id], onDelete: Cascade)
+  company                    companies  @relation(fields: [company_id], references: [id], onDelete: Cascade)
+
+  @@index([company_id, import_id])
+  @@index([company_id, alias_hash])
+  @@index([match_status])
+  @@index([company_id, canonical_item_id_final])
+  @@map("import_rows")
+}
+
+// ============================================================
+// 2. CAMADA CANONICAL — identidade permanente + histórico
+// ============================================================
+
+enum StatusCompetencia {
+  DRAFT
+  PROCESSING
+  REVIEW
+  VALIDATED
+  CLOSED
+}
+
+model periods {
+  id                String            @id @default(uuid())
+  company_id        String
+  competencia       String            @db.VarChar(6) // YYYYMM ex: "202609" -> SET/26
+  data_inicio       DateTime          @db.Date
+  data_fim          DateTime          @db.Date
+  status            StatusCompetencia @default(DRAFT)
+  metodo_id         String?           // FK p/ metodologia aplicada (obrigatório p/ VALIDATED/CLOSED)
+  descricao         String?           // título amigável ex: "SET/26 Competência de Referência"
+
+  // Responsáveis e timestamps do lifecycle
+  criado_por        String?           // user_id
+  validado_em       DateTime?
+  validado_por      String?           // user_id
+  fechado_em        DateTime?
+  fechado_por       String?           // user_id
+  ultima_reabertura_em       DateTime?
+  ultima_reabertura_por       String?
+  ultima_reabertura_justificativa String? @db.VarChar(1000)
+
+  // Contadores do mês (atualizados via importação)
+  total_itens_importados  Int?   // linhas válidas importadas
+  itens_reconhecidos      Int?   // com canonical_item_id definido (auto ou revisão humana)
+  itens_pendentes_revisao Int?   // matching_reviews AINDA NÃO decididos
+  itens_novos             Int?   // criados como NOVOS nesta competência
+
+  // Preparação para regra: "fechar só quando ICPP calculado e validado"
+  icpp_calculado      Boolean?         @default(false)
+  icpp_homologado     Boolean?         @default(false)
+  pendencia_critica   String?          @db.VarChar(1000) // motivo pq não pode fechar (null = ok)
+  observacao          String?
+
+  created_at        DateTime          @default(now())
+  updated_at        DateTime          @updatedAt
+
+  company              companies           @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  imports              imports[]
+  item_prices          item_prices[]
+  icpp_methodology     icpp_methodologies? @relation(fields: [metodo_id], references: [id], onDelete: SetNull)
+  external_index_vals  external_index_values[]
+  icpp_results         icpp_results[]
+
+  @@unique([company_id, competencia])
+  @@index([company_id, status])
+  @@index([company_id, created_at])
+  @@map("periods")
+}
+
+model categories {
+  id         String   @id @default(uuid())
+  company_id String
+  codigo     String?  // código amigável (não é PK)
+  nome       String   // ex: "MAT Bloco de Concreto"
+  ordem      Int      @default(0)
+  ativo      Boolean  @default(true)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  company         companies       @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  families        families[]
+  canonical_items canonical_items[]
+
+  @@unique([company_id, nome])
+  @@index([company_id])
+  @@map("categories")
+}
+
+model families {
+  id           String   @id @default(uuid())
+  company_id   String
+  category_id  String
+  nome         String   // ex: "Janela de correr"
+  ordem        Int      @default(0)
+  ativo        Boolean  @default(true)
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  company         companies       @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  category        categories      @relation(fields: [category_id], references: [id], onDelete: Cascade)
+  canonical_items canonical_items[]
+
+  @@unique([company_id, category_id, nome])
+  @@index([company_id, category_id])
+  @@map("families")
+}
+
+model canonical_items {
+  id                 String   @id // ID permanente: formato MAT-ESQ-0038 (gerado no app)
+  company_id         String
+  category_id        String
+  family_id          String?
+  nome_oficial       String   // nome canônico oficial
+  unidade_padrao     String?  // "unid" | "m²" | "m³" | "kg" | ...
+
+  // ---------- CARACTERÍSTICAS ESTRUTURADAS (IA) ----------
+  // PADRÃO (não obrigatório): {tipo, material, modelo, abertura, folhas,
+  // largura_m, altura_m, diametro, espessura, classe, resistencia, ...}
+  caracteristicas_json Json?
+
+  created_by         String?
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+
+  company         companies    @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  category        categories   @relation(fields: [category_id], references: [id], onDelete: Cascade)
+  family          families?    @relation(fields: [family_id], references: [id], onDelete: SetNull)
+  aliases         item_aliases[]
+  precos          item_prices[]
+  pesos           basket_weights[]
+
+  @@unique([company_id, id])
+  @@index([company_id, category_id])
+  @@index([company_id, family_id])
+  @@map("canonical_items")
+}
+
+model item_aliases {
+  id                 String   @id @default(uuid())
+  company_id         String
+  canonical_item_id  String
+  descricao_original String   // descrição EXATA como veio no Excel
+  descricao_normalizada String // normalizada (upper, sem acentos, sem pontuação)
+  alias_hash         String   @db.VarChar(64) // hash do normalizado p/ match rápido
+  periodo_origem_id  String?  // quando foi descoberto
+  mapeado_por        String?  // user_id (null se IA)
+  mapeado_em         DateTime @default(now())
+
+  canonical_item canonical_items @relation(fields: [canonical_item_id], references: [id], onDelete: Cascade)
+  company        companies       @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  period         periods?        @relation(fields: [periodo_origem_id], references: [id], onDelete: SetNull)
+
+  @@unique([company_id, alias_hash])
+  @@index([company_id, canonical_item_id])
+  @@map("item_aliases")
+}
+
+enum AcaoRevisao {
+  CONFIRMAR_MATCH
+  ESCOLHER_OUTRO
+  CRIAR_NOVO
+  ADIAR
+  IGNORAR
+}
+
+model matching_reviews {
+  id                  String     @id @default(uuid())
+  company_id          String
+  import_row_id       String
+  acao                AcaoRevisao?
+  canonical_item_id_escolhido String?
+  observacao          String?
+  decided_by          String?
+  decided_at          DateTime?
+  created_at          DateTime   @default(now())
+
+  company   companies   @relation(fields: [company_id], references: [id], onDelete: Cascade)
+
+  @@index([company_id, created_at])
+  @@map("matching_reviews")
+}
+
+model item_prices {
+  id                 String   @id @default(uuid())
+  company_id         String
+  canonical_item_id  String
+  period_id          String
+
+  // ---------- DADOS DO MÊS (preservado exatamente como veio) ----------
+  descricao_usada    String   // descrição utilizada NESTE mês (pode mudar todo mês)
+  codigo_usado       String?
+  categoria_usada    String?
+  unidade_usada      String?
+  quantidade         Decimal? @db.Decimal(20, 6)
+  preco_unitario     Decimal? @db.Decimal(20, 6)
+  preco_total_global Decimal? @db.Decimal(22, 6)
+  peso_no_orcamento  Decimal? @db.Decimal(10, 8) // % (da coluna PESO NO ORÇ)
+  eap_nivel          String?
+  eap_codigo         String?
+
+  fonte_import_row_id String?
+  created_by         String?
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+
+  canonical_item canonical_items @relation(fields: [canonical_item_id], references: [id], onDelete: Cascade)
+  period         periods         @relation(fields: [period_id], references: [id], onDelete: Cascade)
+  company        companies       @relation(fields: [company_id], references: [id], onDelete: Cascade)
+
+  // Chave fundamental: UM item canônico POR competência
+  @@unique([company_id, canonical_item_id, period_id])
+  @@index([company_id, period_id])
+  @@index([company_id, canonical_item_id])
+  @@map("item_prices")
+}
+
+// ============================================================
+// 3. CAMADA CALCULATED — pesos, Cesta, ICPP, comparação
+// ============================================================
+
+// -------------------- ÍNDICES EXTERNOS (não calculados pelo CostBase) --------------------
+
+model external_indexes {
+  id              String   @id @default(uuid())
+  company_id      String
+  sigla           String   @db.VarChar(16) // "INCC" | "ICC-SP" | "IPCA" | ...
+  nome            String   // "Índice Nacional da Construção Civil"
+  instituicao     String?  // "FGV" | "IBGE" | ...
+  ativo           Boolean  @default(true)
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  company  companies              @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  values   external_index_values[]
+
+  @@unique([company_id, sigla])
+  @@index([company_id])
+  @@map("external_indexes")
+}
+
+model external_index_values {
+  id                 String   @id @default(uuid())
+  external_index_id  String
+  period_id          String
+  company_id         String
+  valor_indice       Decimal  @db.Decimal(18, 8)  // ex: 1.051366
+  variacao_mensal    Decimal? @db.Decimal(12, 8)  // %
+  acumulado_12m      Decimal? @db.Decimal(12, 8)  // %
+  acumulado_24m      Decimal? @db.Decimal(12, 8)  // %
+  fonte              String?
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+
+  external_index external_indexes @relation(fields: [external_index_id], references: [id], onDelete: Cascade)
+  period         periods          @relation(fields: [period_id], references: [id], onDelete: Cascade)
+  company        companies        @relation(fields: [company_id], references: [id], onDelete: Cascade)
+
+  @@unique([company_id, external_index_id, period_id])
+  @@index([company_id, period_id])
+  @@map("external_index_values")
+}
+
+// -------------------- METODOLOGIA VERSIONADA do ICPP --------------------
+// IMPORTANTE: NÃO existem fórmulas hardcoded no banco.
+// Todas regras ficam em JSONB e são implementadas no Motor de Cálculo do NestJS.
+// Quando PV1-PV10 forem respondidas, uma V1 real substitui o placeholder.
+
+model icpp_methodologies {
+  id                  String   @id @default(uuid())
+  company_id          String
+  versao_nome         String   @db.VarChar(16) // "V1" | "V2" | ...
+  descricao           String?  // documentação humana
+  sigla_indice        String   @default("ICPP-SP")
+
+  // ---------- VIGÊNCIA (isola resultados históricos) ----------
+  valid_from_period_id String?  // null = desde sempre
+  valid_to_period_id   String?  // null = em vigor (método corrente)
+  is_active           Boolean   @default(true)
+
+  // ---------- REGRAS CONFIGURÁVEIS (placeholders — PV1..PV10 pendentes) ----------
+  // Preenchidas APÓS validação com dono do processo
+  regra_pesos_json          Json? // {tipo: "orçamento_base", periodo_base: "202501", incluir_itens_sem_preco: false,...}
+  regra_variacao_item_json  Json? // {preco_base: "preco_unitario"|"preco_total", tratar_sem_preco: "mantem_anterior"|"excluir",...}
+  regra_itens_novos_json    Json? // {tratamento: "delta_zero_no_mes_entrada", incluir_peso: "redistribuir"|"separar",...}
+  regra_itens_saida_json    Json? // {tratamento: "manter_historico", redistribuir_peso: true,...}
+  regra_mes_base_num_indice Json? // {periodo: "202311", valor: 100}
+  regra_calculo_acumulado_json Json? // {janela_12m: "multiplicativo_12_periodos", janela_24m: "..."}
+  regra_outliers_json       Json? // {limite_superior: 0.50, acao: "marcar_para_revisao", ...}
+  regra_substituicao_json   Json? // {metodo: "link_indice", ...}
+
+  created_by          String?
+  created_at          DateTime @default(now())
+  updated_at          DateTime @updatedAt
+
+  company            companies        @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  periods_aplicados  periods[]        // competências que usam este método
+  basket_weights     basket_weights[]
+  icpp_results       icpp_results[]
+
+  @@unique([company_id, versao_nome])
+  @@index([company_id, is_active])
+  @@map("icpp_methodologies")
+}
+
+// -------------------- PESOS — associados a METODOLOGIA --------------------
+
+model basket_weights {
+  id                 String   @id @default(uuid())
+  company_id         String
+  methodology_id     String
+  canonical_item_id  String
+
+  // ---------- PESOS (importados do Excel ou definidos na metodologia) ----------
+  peso_item          Decimal  @db.Decimal(12, 8) // % participação do item no orçamento
+  peso_categoria     Decimal? @db.Decimal(12, 8) // cache do peso da categoria
+
+  // ---------- REFERÊNCIA (para auditoria de onde veio o peso) ----------
+  periodo_origem_id  String? // competência de onde foi extraído (PV1)
+  fonte_preco_total  Decimal? @db.Decimal(22, 6) // preço total base do cálculo
+
+  created_at         DateTime @default(now())
+  updated_at         DateTime @updatedAt
+
+  methodology    icpp_methodologies @relation(fields: [methodology_id], references: [id], onDelete: Cascade)
+  canonical_item canonical_items    @relation(fields: [canonical_item_id], references: [id], onDelete: Cascade)
+  period         periods?           @relation(fields: [periodo_origem_id], references: [id], onDelete: SetNull)
+  company        companies          @relation(fields: [company_id], references: [id], onDelete: Cascade)
+
+  @@unique([company_id, methodology_id, canonical_item_id])
+  @@index([company_id, methodology_id])
+  @@map("basket_weights")
+}
+
+// -------------------- RESULTADOS CALCULADOS e CONGELADOS --------------------
+
+model icpp_results {
+  id                 String   @id @default(uuid())
+  company_id         String
+  period_id          String
+  methodology_id     String
+
+  // ---------- Números calculados ----------
+  numero_indice      Decimal  @db.Decimal(18, 8)   // I(t)
+  variacao_mensal    Decimal? @db.Decimal(12, 8)   // Δ ICPP(t) em %
+  acumulado_12m      Decimal? @db.Decimal(12, 8)   // %
+  acumulado_24m      Decimal? @db.Decimal(12, 8)   // %
+
+  // ---------- Controles de auditoria do cálculo ----------
+  hash_calculo       String   @db.VarChar(64)  // hash dos inputs + versão do motor → reproduzibilidade
+  qtd_itens_cesta    Int      @default(0)
+  qtd_itens_validos  Int      @default(0)
+  qtd_itens_excluidos Int     @default(0)
+  itens_excluidos_json Json?  // array com motivos p/ auditoria
+  versao_motor       String   @db.VarChar(16)  // versão do código de cálculo (ex: "0.1.0")
+
+  calculado_em       DateTime @default(now())
+  calculado_por      String?
+
+  period         periods           @relation(fields: [period_id], references: [id], onDelete: Cascade)
+  methodology    icpp_methodologies @relation(fields: [methodology_id], references: [id], onDelete: Cascade)
+  company        companies         @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  category_r     category_results[]
+
+  // Resultado UNO por competência + metodologia
+  @@unique([company_id, period_id, methodology_id])
+  @@index([company_id, period_id])
+  @@map("icpp_results")
+}
+
+model category_results {
+  id                     String   @id @default(uuid())
+  company_id             String
+  icpp_result_id         String
+  category_id            String
+
+  peso_categoria         Decimal  @db.Decimal(12, 8) // %
+  variacao_categoria     Decimal? @db.Decimal(12, 8) // %
+  contribuicao_pontos_pct Decimal @db.Decimal(12, 8) // contribuição em pontos percentuais p/ ICPP
+  soma_preco_total_atual Decimal? @db.Decimal(22, 6)
+  soma_preco_total_ant   Decimal? @db.Decimal(22, 6)
+  detalhamento_itens_json Json?   // {item_id: {contribuicao, peso, variacao}} p/ drill-down rápido
+
+  icpp_result icpp_results @relation(fields: [icpp_result_id], references: [id], onDelete: Cascade)
+
+  @@unique([icpp_result_id, category_id])
+  @@index([company_id, category_id])
+  @@map("category_results")
+}
+
+// ============================================================
+// AUDITORIA — NUNCA apagar estas linhas
+// ============================================================
+
+enum TipoAcaoAudit {
+  CREATE
+  UPDATE
+  DELETE
+  MAPEOU_ALIAS
+  DESFEZ_MAPEO
+  REABRIU_COMPETENCIA
+  FECHOU_COMPETENCIA
+  ALTEROU_PESO
+  RECALCULOU_ICPP
+  IMPORTOU_ARQUIVO
+}
+
+model audit_logs {
+  id                 String        @id @default(uuid())
+  company_id         String
+  user_id            String?
+  entidade           String        @db.VarChar(48)  // "canonical_item" | "period" | "basket_weight" | ...
+  entidade_id        String?
+  acao               TipoAcaoAudit
+  valor_anterior_json Json?        // estado ANTES (null se CREATE)
+  valor_novo_json    Json?        // estado DEPOIS (null se DELETE)
+  ip_usuario         String?
+  observacao         String?
+  created_at         DateTime      @default(now())
+
+  user    users?     @relation(fields: [user_id], references: [id], onDelete: SetNull)
+  company companies  @relation(fields: [company_id], references: [id], onDelete: Cascade)
+
+  @@index([company_id, created_at])
+  @@index([company_id, entidade, entidade_id])
+  @@index([company_id, acao])
+  @@map("audit_logs")
+}

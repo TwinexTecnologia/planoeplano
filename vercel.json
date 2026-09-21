@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "buildCommand": "npm run build:frontend",
+  "installCommand": "npm install --no-audit --no-fund --include=dev",
+  "outputDirectory": "apps/frontend/.next",
+  "build": {
+    "env": {
+      "NEXT_TELEMETRY_DISABLED": "1"
+    }
+  },
+  "env": {
+    "NEXT_PUBLIC_APP_NAME": "CostBase"
+  }
+}
